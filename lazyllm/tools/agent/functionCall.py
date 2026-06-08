@@ -38,30 +38,81 @@ class StreamResponse():
         return package(*inputs)
 
 
-_COMPACTION_TRUNCATE_LEN = 200  # chars kept per old tool result
+_COMPACTION_TRUNCATE_LEN = 200
+_CURRENT_TOOL_RESULT_TRUNCATE_LEN = 3000
+_ASSISTANT_CONTENT_TRUNCATE_LEN = 800
+_ASSISTANT_REASONING_TRUNCATE_LEN = 600
+_MAX_COMPACT_COLLECTION_ITEMS = 12
+
+
+def _truncate_text(text: Any, limit: int) -> str:
+    content = '' if text is None else str(text)
+    if limit <= 0 or len(content) <= limit:
+        return content
+    return f'[truncated {len(content)} chars] {content[:limit]}...'
+
+
+def _compact_tool_result_value(value: Any, *, depth: int = 0) -> Any:
+    if isinstance(value, str):
+        limit = _CURRENT_TOOL_RESULT_TRUNCATE_LEN if depth == 0 else max(256, _CURRENT_TOOL_RESULT_TRUNCATE_LEN // 4)
+        return _truncate_text(value, limit)
+    if isinstance(value, list):
+        kept = [_compact_tool_result_value(item, depth=depth + 1) for item in value[:_MAX_COMPACT_COLLECTION_ITEMS]]
+        if len(value) > _MAX_COMPACT_COLLECTION_ITEMS:
+            kept.append(f'...[truncated {len(value) - _MAX_COMPACT_COLLECTION_ITEMS} items]...')
+        return kept
+    if isinstance(value, dict):
+        compacted: Dict[str, Any] = {}
+        items = list(value.items())
+        for key, item_value in items[:_MAX_COMPACT_COLLECTION_ITEMS]:
+            compacted[str(key)] = _compact_tool_result_value(item_value, depth=depth + 1)
+        if len(items) > _MAX_COMPACT_COLLECTION_ITEMS:
+            compacted['__truncated_keys__'] = len(items) - _MAX_COMPACT_COLLECTION_ITEMS
+        return compacted
+    return value
+
+
+def _serialize_tool_result(value: Any, *, limit: int = _CURRENT_TOOL_RESULT_TRUNCATE_LEN) -> str:
+    compacted = _compact_tool_result_value(value)
+    if isinstance(compacted, str):
+        return _truncate_text(compacted, limit)
+    try:
+        serialized = json.dumps(compacted, ensure_ascii=False)
+    except TypeError:
+        serialized = str(compacted)
+    return _truncate_text(serialized, limit)
+
+
+def _compact_assistant_message(message: Dict[str, Any]) -> Dict[str, Any]:
+    compacted = dict(message)
+    if 'content' in compacted:
+        compacted['content'] = _truncate_text(compacted.get('content', ''), _ASSISTANT_CONTENT_TRUNCATE_LEN)
+    reasoning = compacted.get('reasoning_content')
+    if reasoning:
+        compacted['reasoning_content'] = _truncate_text(reasoning, _ASSISTANT_REASONING_TRUNCATE_LEN)
+    return compacted
 
 
 def _compact_chat_history(history: List[Dict[str, Any]], keep_full_turns: int) -> List[Dict[str, Any]]:
-    # identify tool-result message indices (role == 'tool'), from oldest to newest
     tool_indices = [i for i, m in enumerate(history) if m.get('role') == 'tool']
-    # keep the last keep_full_turns tool results intact; truncate the rest
-    cutoff = len(tool_indices) - keep_full_turns
-    if cutoff <= 0:
+    assistant_tool_turn_indices = [
+        i for i, m in enumerate(history)
+        if m.get('role') == 'assistant' and isinstance(m.get('tool_calls'), list) and m.get('tool_calls')
+    ]
+    tool_cutoff = len(tool_indices) - keep_full_turns
+    assistant_cutoff = len(assistant_tool_turn_indices) - keep_full_turns
+    to_truncate = set(tool_indices[:tool_cutoff]) if tool_cutoff > 0 else set()
+    to_compact_assistants = (
+        set(assistant_tool_turn_indices[:assistant_cutoff]) if assistant_cutoff > 0 else set()
+    )
+    if not to_truncate and not to_compact_assistants:
         return list(history)
-    to_truncate = set(tool_indices[:cutoff])
     result = []
     for i, msg in enumerate(history):
+        if i in to_compact_assistants:
+            msg = _compact_assistant_message(msg)
         if i in to_truncate:
-            content = msg.get('content', '')
-            if content is None:
-                content = ''
-            if isinstance(content, list):
-                content = ' '.join(
-                    p.get('text', '') if isinstance(p, dict) else str(p) for p in content
-                )
-            if isinstance(content, str) and len(content) > _COMPACTION_TRUNCATE_LEN:
-                truncated = content[:_COMPACTION_TRUNCATE_LEN]
-                msg = dict(msg, content=f'[truncated {len(content)} chars] {truncated}...')
+            msg = dict(msg, content=_serialize_tool_result(msg.get('content', ''), limit=_COMPACTION_TRUNCATE_LEN))
         result.append(msg)
     return result
 
@@ -126,17 +177,17 @@ class FunctionCall(ModuleBase):
             tool_call_results = [
                 {
                     'role': 'tool',
-                    'content': str(tool_call['tool_call_result']),
+                    'content': _serialize_tool_result(tool_call.get('tool_call_result')),
                     'tool_call_id': tool_call['id'],
                     'name': tool_call['function']['name'],
                 } for tool_call in workspace['tool_call_trace']
             ]
-            workspace['history'].append({
+            workspace['history'].append(_compact_assistant_message({
                 'role': 'assistant',
                 'content': input.get('content', ''),
                 'tool_calls': input.get('tool_calls', []),
                 'reasoning_content': input.get('reasoning_content', ''),
-            })
+            }))
             input = {'input': tool_call_results}
             history_idx += 1
             workspace['history'].extend(tool_call_results)

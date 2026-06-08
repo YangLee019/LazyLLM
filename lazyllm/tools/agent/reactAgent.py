@@ -131,10 +131,23 @@ class ReactAgent(LazyLLMAgentBase):
         )
         summarize_llm = self._llm.share(stream=False)
         resp = summarize_llm(summarize_prompt)
-        summary = resp if isinstance(resp, str) else (
-            resp.get('content', '') if isinstance(resp, dict) else None
-        )
-        return summary if summary else None
+        if isinstance(resp, str) and resp.strip():
+            return resp.strip()
+        if isinstance(resp, dict):
+            for key in ('content', 'text', 'message'):
+                value = resp.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        if isinstance(resp, (list, tuple)):
+            for value in resp:
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+                if isinstance(value, dict):
+                    for key in ('content', 'text', 'message'):
+                        candidate = value.get(key)
+                        if isinstance(candidate, str) and candidate.strip():
+                            return candidate.strip()
+        return None
 
     def _post_process(self, ret):
         if isinstance(ret, str):

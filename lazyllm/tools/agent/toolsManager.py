@@ -271,8 +271,12 @@ class MethodModuleTool(ModuleTool):
         super().__init__(execute_in_sandbox=False, apply_func=_apply, schema_func=bound)
         self._instance = instance
         self._method_name = method_name
-        self._name = instance.__class__.__name__ if method_name == '__call__' \
-            else f'{instance.__class__.__name__}_{method_name}'
+        if method_name == '__call__':
+            self._name = instance.__class__.__name__
+        elif getattr(type(instance), '__tool_group_use_method_name__', False):
+            self._name = method_name
+        else:
+            self._name = f'{instance.__class__.__name__}_{method_name}'
 
 
 def _gen_args_info_from_moduletool_and_docstring(tool, parsed_docstring):
@@ -439,7 +443,14 @@ class InstanceToolGroup(SkipMixin, ToolGroup):
         tools = [MethodModuleTool(instance, m) for m in instance.__public_apis__]
         name = instance.__class__.__name__
         desc = getattr(type(instance), '__doc__', '') or ''
-        ToolGroup.__init__(self, tools=tools, name=name, desc=desc, lazy=True)
+        ToolGroup.__init__(
+            self,
+            tools=tools,
+            name=name,
+            desc=desc,
+            lazy=getattr(type(instance), '__tool_group_lazy__', True),
+            prefix=getattr(type(instance), '__tool_group_prefix__', True),
+        )
 
     @property
     def _tools(self) -> Dict[str, 'ModuleTool']:
